@@ -1,0 +1,150 @@
+# Mod submissions (BeatForge's docs/distribution-design.md §9.2). BeatForge's Submit opens an issue that names a
+# .bh2mod on a branch of the submitter's fork. `check` validates it and reports on the issue. The `approved` label,
+# added by the owner, runs `publish`: the mod becomes a release and the signed index gains it.
+#
+# The source of this file is BeatForge's repo (release/beatforge-mods/); change it there.
+name: Submission
+
+on:
+  issues:
+    types: [opened, edited, reopened, labeled]
+
+permissions: {}
+
+env:
+  # bf-registry is BeatForge's own import validation as a command-line tool. Pinned by hash: a changed file at this
+  # URL is refused.
+  TOOL_URL: https://github.com/jamesnail/beatforge-mods/releases/download/tools/bf-registry.exe
+  TOOL_SHA256: 6F21F1467515570952A69D5292F3B939A644EA893E9E48D8AD101BAAB2C4AC5B
+  GH_TOKEN: ${{ github.token }}
+  ISSUE: ${{ github.event.issue.number }}
+
+jobs:
+  check:
+    name: Check the submission
+    if: github.event.action != 'labeled' && contains(github.event.issue.body, 'beatforge-submission')
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Get bf-registry
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:TOOL_URL -OutFile bf-registry.exe
+          if ((Get-FileHash bf-registry.exe -Algorithm SHA256).Hash -ne $env:TOOL_SHA256) { throw "bf-registry.exe isn't the pinned build" }
+
+      - name: Get the index
+        shell: pwsh
+        run: |
+          # No index release yet (404) is the first publish. Any other failure stops here: guessing "first" would
+          # drop every mod from the index.
+          $out = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/index" 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) {
+            gh release download index --repo $env:GITHUB_REPOSITORY --dir index --pattern "index.json" --pattern "index.json.sig"
+            if ($LASTEXITCODE -ne 0) { throw "couldn't download the index" }
+            "INDEX_ARGS=--index index" >> $env:GITHUB_ENV
+          } elseif ($out -match "HTTP 404") {
+            "INDEX_ARGS=--first" >> $env:GITHUB_ENV
+          } else {
+            throw $out
+          }
+
+      - name: Check
+        shell: pwsh
+        run: |
+          ./bf-registry.exe issue --event $env:GITHUB_EVENT_PATH --out out @($env:INDEX_ARGS -split " ")
+          if ($LASTEXITCODE -ne 0) { throw "bf-registry failed" }
+
+      - name: Report
+        shell: pwsh
+        run: |
+          gh issue comment $env:ISSUE --repo $env:GITHUB_REPOSITORY --body-file out/report.md
+          # An edit starts over: old verdicts and an old approval don't carry to the changed submission.
+          $labels = (Get-Content out/labels.txt | Where-Object { $_ }) -join ","
+          gh issue edit $env:ISSUE --repo $env:GITHUB_REPOSITORY --remove-label "valid,invalid,new-mod,new-version,patch,approved"
+          gh issue edit $env:ISSUE --repo $env:GITHUB_REPOSITORY --add-label $labels
+          if ($LASTEXITCODE -ne 0) { throw "couldn't label the issue" }
+
+  publish:
+    name: Publish
+    # Only the owner's `approved` label publishes. Labels can't be added by people without access to the repo.
+    if: >-
+      github.event.action == 'labeled' && github.event.label.name == 'approved' &&
+      github.event.sender.login == 'jamesnail' && github.event.issue.state == 'open'
+    runs-on: windows-latest
+    environment: publish
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Get bf-registry
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:TOOL_URL -OutFile bf-registry.exe
+          if ((Get-FileHash bf-registry.exe -Algorithm SHA256).Hash -ne $env:TOOL_SHA256) { throw "bf-registry.exe isn't the pinned build" }
+
+      - name: Get the index
+        shell: pwsh
+        run: |
+          $out = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/index" 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) {
+            gh release download index --repo $env:GITHUB_REPOSITORY --dir index --pattern "index.json" --pattern "index.json.sig"
+            if ($LASTEXITCODE -ne 0) { throw "couldn't download the index" }
+            "INDEX_ARGS=--index index" >> $env:GITHUB_ENV
+          } elseif ($out -match "HTTP 404") {
+            "INDEX_ARGS=--first" >> $env:GITHUB_ENV
+          } else {
+            throw $out
+          }
+
+      - name: Check again and sign the new index
+        shell: pwsh
+        env:
+          PUBLISH_MOD_KEY: ${{ secrets.PUBLISH_MOD_KEY }}
+          PUBLISH_MOD_KEY_PASSWORD: ${{ secrets.PUBLISH_MOD_KEY_PASSWORD }}
+        run: |
+          ./bf-registry.exe publish --event $env:GITHUB_EVENT_PATH --out out @($env:INDEX_ARGS -split " ")
+          if ($LASTEXITCODE -eq 2) {
+            gh issue comment $env:ISSUE --repo $env:GITHUB_REPOSITORY --body-file out/report.md
+            gh issue edit $env:ISSUE --repo $env:GITHUB_REPOSITORY --remove-label "approved,valid" --add-label "invalid"
+            throw "the submission no longer passes"
+          }
+          if ($LASTEXITCODE -ne 0) { throw "bf-registry failed" }
+
+      - name: Release the mod
+        shell: pwsh
+        run: |
+          $r = Get-Content out/result.json -Raw | ConvertFrom-Json
+          $repo = $env:GITHUB_REPOSITORY
+          gh release view $r.tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # A rerun after a failure further down: the release is there, make sure of its file.
+            gh release upload $r.tag "out/$($r.asset)" --repo $repo --clobber
+          } else {
+            gh release create $r.tag "out/$($r.asset)" --repo $repo --title "$($r.name) $($r.version)" --notes "Submitted in #$env:ISSUE. Install it from BeatForge's Browse page." --latest=false
+          }
+          if ($LASTEXITCODE -ne 0) { throw "couldn't release the mod" }
+
+      - name: Publish the index
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          if ($env:INDEX_ARGS -eq "--first") {
+            # `create` fails if the release exists, so a first publish can never replace an index.
+            gh release create index out/index.json out/index.json.sig --repo $repo --title "Mod index" --notes "The catalogue BeatForge reads: index.json and its signature. Replaced on every publish." --latest=false
+          } else {
+            gh release upload index out/index.json.sig out/index.json --repo $repo --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { throw "couldn't publish the index" }
+
+      - name: Close the issue
+        shell: pwsh
+        run: |
+          $r = Get-Content out/result.json -Raw | ConvertFrom-Json
+          gh issue comment $env:ISSUE --repo $env:GITHUB_REPOSITORY --body "Published: **$($r.name) $($r.version)** is in BeatForge's Browse page now."
+          gh issue edit $env:ISSUE --repo $env:GITHUB_REPOSITORY --add-label "published"
+          gh issue close $env:ISSUE --repo $env:GITHUB_REPOSITORY --reason completed
