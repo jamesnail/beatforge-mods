@@ -46,6 +46,7 @@ jobs:
             "INDEX_ARGS=--index index" >> $env:GITHUB_ENV
           } elseif ($out -match "HTTP 404") {
             "INDEX_ARGS=--first" >> $env:GITHUB_ENV
+            $global:LASTEXITCODE = 0  # the 404 is the answer, not a failure of this step
           } else {
             throw $out
           }
@@ -97,6 +98,7 @@ jobs:
             "INDEX_ARGS=--index index" >> $env:GITHUB_ENV
           } elseif ($out -match "HTTP 404") {
             "INDEX_ARGS=--first" >> $env:GITHUB_ENV
+            $global:LASTEXITCODE = 0  # the 404 is the answer, not a failure of this step
           } else {
             throw $out
           }
